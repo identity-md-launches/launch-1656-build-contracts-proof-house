@@ -53,6 +53,37 @@ contract ArtifactsSourceTest is Fixture {
         assertEq(source.payloadSize(), 4);
     }
 
+    /// @dev The 5% raise rounds up, so even dust-sized bids must strictly exceed the high bid.
+    function test_tinyBidsMustStrictlyExceed() public {
+        vm.startPrank(curator);
+        source.storePayloadChunk("x");
+        source.lockPayload();
+        source.setAuction(1, uint64(vm.getBlockTimestamp() + 1 hours));
+        vm.stopPrank();
+        vm.prank(alice);
+        source.bid{value: 19}(address(0));
+        vm.prank(bob);
+        vm.expectRevert(ArtifactsSource.BidTooLow.selector);
+        source.bid{value: 19}(address(0));
+        vm.prank(bob);
+        source.bid{value: 20}(address(0));
+        assertEq(source.highBidder(), bob);
+        vm.prank(carol);
+        vm.expectRevert(ArtifactsSource.BidTooLow.selector);
+        source.bid{value: 20}(address(0));
+        vm.prank(carol);
+        source.bid{value: 21}(address(0));
+        assertEq(source.highBidder(), carol);
+        // at 100 wei exactly 5% is required: 104 fails, 105 passes
+        vm.prank(alice);
+        source.bid{value: 100}(address(0));
+        vm.prank(bob);
+        vm.expectRevert(ArtifactsSource.BidTooLow.selector);
+        source.bid{value: 104}(address(0));
+        vm.prank(bob);
+        source.bid{value: 105}(address(0));
+    }
+
     function test_auctionRules() public {
         vm.prank(curator);
         source.storePayloadChunk("payload");

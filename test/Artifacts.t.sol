@@ -56,6 +56,47 @@ contract ArtifactsFactoryTest is Fixture {
         assertEq(factory.remaining(), 255);
     }
 
+    /// @dev A purchase whose VRF request is never answered can be re-requested by the curator after the retry
+    /// window; the old id is forgotten and the buyer still gets exactly one edition.
+    function test_rerequestRandomnessAfterDroppedRequest() public {
+        _publishAll();
+        _openSale(1 ether);
+        vm.prank(alice);
+        uint256 id = factory.buy{value: 1 ether}(address(0));
+        assertEq(factory.requestEdition(id), 0);
+        assertEq(factory.sold(), 1);
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.RequestTooRecent.selector);
+        factory.rerequestRandomness(id);
+        vm.roll(vm.getBlockNumber() + factory.VRF_RETRY_BLOCKS());
+        vm.prank(alice);
+        vm.expectRevert(TwoStepOwnable.NotOwner.selector);
+        factory.rerequestRandomness(id);
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.UnknownRequest.selector);
+        factory.rerequestRandomness(id + 99);
+        vm.prank(curator);
+        uint256 newId = factory.rerequestRandomness(id);
+        assertTrue(newId != id);
+        assertEq(factory.requestBuyer(id), address(0));
+        assertEq(factory.requestBuyer(newId), alice);
+        // a late answer to the forgotten request is rejected
+        vm.expectRevert(ArtifactsFactory.UnknownRequest.selector);
+        vrf.fulfill(id, 5);
+        vrf.fulfill(newId, 5);
+        uint256 edition = factory.requestEdition(newId);
+        assertTrue(edition >= 1 && edition <= 255);
+        assertEq(factory.editionBuyer(edition), alice);
+        assertEq(factory.editionsOf(alice).length, 1);
+        assertEq(factory.sold(), 1);
+        assertEq(factory.assigned(), 1);
+        // a fulfilled request cannot be re-requested
+        vm.roll(vm.getBlockNumber() + factory.VRF_RETRY_BLOCKS());
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.AlreadyFulfilled.selector);
+        factory.rerequestRandomness(newId);
+    }
+
     function test_vrfMustBeConfiguredOnce() public {
         vm.prank(curator);
         vm.expectRevert(ArtifactsFactory.VRFAlreadyConfigured.selector);
@@ -339,6 +380,77 @@ contract ArtifactsPieceEscrowTest is Fixture {
         piece.transferFrom(bob, carol, 1);
         (, address seller,,,,) = piece.escrow();
         assertEq(seller, address(0));
+    }
+
+    /// @dev After release the paid seller keeps no re-key right: the delivered key cannot be overwritten.
+    function test_sellerCannotOverwriteKeyAfterRelease() public {
+        vm.prank(alice);
+        piece.list(2 ether);
+        vm.prank(bob);
+        piece.buy{value: 2 ether}(keccak256("bobvk"));
+        vm.prank(alice);
+        piece.postEscrowKey("rewrapped-for-bob");
+        vm.prank(bob);
+        piece.release();
+        assertEq(piece.ownerOf(1), bob);
+        assertEq(piece.previousOwner(), address(0));
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.NotPreviousOwner.selector);
+        piece.rewrapFor("garbage");
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.NotPreviousOwner.selector);
+        piece.rewrapFor("");
+        assertEq(piece.wrappedKey(), "rewrapped-for-bob");
+        // a later plain transfer by bob gives bob (not alice) the one-shot re-key right
+        vm.prank(bob);
+        piece.transferFrom(bob, carol, 1);
+        assertEq(piece.previousOwner(), bob);
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.NotPreviousOwner.selector);
+        piece.rewrapFor("garbage");
+    }
+
+    /// @dev Re-keying after a plain transfer is one shot and never empty.
+    function test_rewrapIsOneShotAndNonEmpty() public {
+        vm.prank(alice);
+        piece.transferFrom(alice, bob, 1);
+        vm.prank(bob);
+        piece.registerViewingKey(keccak256("bobvk"));
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.KeyNotPosted.selector);
+        piece.rewrapFor("");
+        vm.prank(alice);
+        piece.rewrapFor("k-for-bob");
+        assertEq(piece.previousOwner(), address(0));
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.NotPreviousOwner.selector);
+        piece.rewrapFor("k2");
+        assertEq(piece.wrappedKey(), "k-for-bob");
+    }
+
+    function test_escrowKeyMustNotBeEmpty() public {
+        vm.prank(alice);
+        piece.list(1 ether);
+        vm.prank(bob);
+        piece.buy{value: 1 ether}(keccak256("bobvk"));
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.KeyNotPosted.selector);
+        piece.postEscrowKey("");
+        // the buyer's cancel right is intact
+        vm.prank(bob);
+        piece.cancel();
+        assertEq(piece.pendingWithdrawals(bob), 1 ether);
+    }
+
+    function test_pieceViewingKeyZeroRejected() public {
+        vm.prank(bob);
+        vm.expectRevert(ArtifactsPiece.NoViewingKey.selector);
+        piece.registerViewingKey(bytes32(0));
+        vm.prank(alice);
+        piece.list(1 ether);
+        vm.prank(bob);
+        vm.expectRevert(ArtifactsPiece.NoViewingKey.selector);
+        piece.buy{value: 1 ether}(bytes32(0));
     }
 
     function test_reentrancyOnEscrowWithdrawBlocked() public {

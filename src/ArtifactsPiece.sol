@@ -127,17 +127,22 @@ contract ArtifactsPiece is ERC721Lite, ReentrancyGuard {
     // ---------- keys ----------
 
     function registerViewingKey(bytes32 key) external {
+        if (key == bytes32(0)) revert NoViewingKey();
         viewingKeyOf[msg.sender] = key;
         emit ViewingKeyRegistered(msg.sender, key);
     }
 
     /// @notice After a plain transfer the previous owner (or the controller, for first claims) re-wraps K to the
-    /// new owner's viewing key and posts it here.
+    /// new owner's viewing key and posts it here. One shot: the key slot must be empty, and posting ends the
+    /// previous owner's right, so a delivered key can never be overwritten.
     function rewrapFor(bytes calldata wrapped) external {
         if (msg.sender != previousOwner && msg.sender != controller) revert NotPreviousOwner();
+        if (wrappedKey.length != 0) revert KeyAlreadyPosted();
+        if (wrapped.length == 0) revert KeyNotPosted();
         address current = ownerOf(TOKEN_ID);
         if (viewingKeyOf[current] == bytes32(0)) revert NoViewingKey();
         wrappedKey = wrapped;
+        delete previousOwner;
         emit WrappedKeyPosted(msg.sender, current);
     }
 
@@ -179,6 +184,7 @@ contract ArtifactsPiece is ERC721Lite, ReentrancyGuard {
         if (msg.sender != e.seller) revert NotSeller();
         if (e.buyer == address(0)) revert NoEscrowBuyer();
         if (e.keyPosted) revert KeyAlreadyPosted();
+        if (wrapped.length == 0) revert KeyNotPosted();
         e.keyPosted = true;
         e.key = wrapped;
         emit EscrowKeyPosted();
@@ -216,6 +222,7 @@ contract ArtifactsPiece is ERC721Lite, ReentrancyGuard {
         _transfer(seller, buyer, TOKEN_ID);
         _releasing = false;
         wrappedKey = key;
+        delete previousOwner; // the escrowed key is delivered; the paid seller keeps no re-key right
         emit EscrowReleased(seller, buyer, price, royalty);
     }
 

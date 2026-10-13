@@ -54,7 +54,11 @@ no upgradeability, no DELEGATECALL/SELFDESTRUCT in any launched runtime. ETH lea
 - **Buy an edition**: `ArtifactsFactory.buy{value: price}(broker)`. State is written, the ETH goes to
   `ArtHouse.recordSale` (credits written before any transfer), then a VRF v2.5 request is made. The callback
   `rawFulfillRandomWords` (coordinator only) assigns a uniformly random unassigned edition by a lazy
-  Fisher-Yates over 1..255: none twice, none skipped (tested over all 255 purchases).
+  Fisher-Yates over 1..255: none twice, none skipped (tested over all 255 purchases). If the coordinator never
+  answers a request (Chainlink drops requests an underfunded subscription cannot pay within ~24h), the curator
+  may `rerequestRandomness(requestId)` once `VRF_RETRY_BLOCKS` have passed: the old id is forgotten (a late
+  answer to it is rejected), a new request carries the same buyer, and the purchase still yields exactly one
+  edition. Watch `sold` vs `assigned` and the `Purchased`/`EditionAssigned`/`Rerequested` events.
 - **Claim**: buyer `registerViewingKey(x25519PublicKey)`; curator `postWrappedKey(edition, K wrapped to it)`;
   buyer (or curator) `claim(edition)` deploys the EIP-1167 clone of ArtifactsPiece, named `ARTIFACTS #NNN`,
   symbol `ARTIFACTS`, holding the ciphertext pointer, traits, commitment and wrapped key, and mints token 1 to
@@ -67,7 +71,11 @@ no upgradeability, no DELEGATECALL/SELFDESTRUCT in any launched runtime. ETH lea
   the key is posted. Seller proceeds (minus the 7.5% royalty to the artist's payout) and refunds are pulled with
   `withdraw()`. While a buyer's payment is in escrow the token cannot be transferred. Plain transfers stay allowed
   and clear the wrapped key; the previous owner may `rewrapFor(bytes)` once the new owner registered a key.
-- **THE SOURCE**: single-lot ETH auction. Each bid must be ≥ reserve and ≥ 105% of the high bid; a bid in the
+  Re-keying is one shot: the key slot must be empty, the key must not be empty (nor an escrow key), and posting
+  ends the previous owner's right. A release clears it too, so a paid seller can never overwrite the key the
+  buyer received. Viewing keys cannot be zero.
+- **THE SOURCE**: single-lot ETH auction. Each bid must be ≥ reserve and ≥ 105% of the high bid (the 5% raise
+  rounds up, so a bid always strictly exceeds the high bid, even at dust sizes); a bid in the
   final 10 minutes moves the end to 10 minutes after it; outbid bids are refunded by `withdrawRefund()` (pull).
   `settle()` sends the proceeds through the ledger and deploys THE SOURCE's own contract — a full byte copy of
   ArtifactsPiece's runtime (not a proxy, so the 1.8 MB revealed answer is copied once) named
@@ -81,10 +89,12 @@ no upgradeability, no DELEGATECALL/SELFDESTRUCT in any launched runtime. ETH lea
 ## Plain SVG collections (ArtHouse)
 
 `createCollection(name, symbol, artist)` clones `ArtCollection`; supply = registered pieces. The curator or the
-collection's artist `registerPiece(collection, pieceId, contentHash, title, description)` (next id only),
+collection's artist (while still approved: `revokeArtist` ends curation rights as well as new collections)
+`registerPiece(collection, pieceId, contentHash, title, description)` (next id only),
 `uploadChunk(collection, pieceId, index, data)` (next index only, ≤100 KB per piece), `finalizePiece`
-(keccak256 of the chunks must equal `contentHash`); the curator may `clearPiece` while unfinalized and
-`sealCollection` once every piece is finalized. Sales start closed: `setPrices(collection, eth, imd)` and
+(keccak256 of the chunks must equal `contentHash`); a mistyped hash, title or description is corrected with
+`updatePiece(collection, pieceId, contentHash, title, description)` while the piece is unfinalized (chunks are
+kept). The curator may `clearPiece` while unfinalized and `sealCollection` once every piece is finalized. Sales start closed: `setPrices(collection, eth, imd)` and
 `setSaleOpen`. `mint(collection, pieceId, broker)` takes exactly the ETH price; `mintWithIMD(collection, pieceId,
 broker, price)` needs `price` to equal the current IMD price and pulls exactly that. `submit(contentHash,
 previewURI)` is open to anyone; the curator `decideSubmission`.
@@ -100,6 +110,7 @@ current owner. Every piece pays a 7.5% ERC-2981 royalty to its artist's payout a
 |----------|-------|-------|
 | `VRF_CALLBACK_GAS` | 250,000 | ArtifactsFactory |
 | `VRF_CONFIRMATIONS` | 3 | ArtifactsFactory |
+| `VRF_RETRY_BLOCKS` | 7,200 (~24 h at 12 s blocks) | ArtifactsFactory |
 | `MIN_RAISE_BPS` | 500 (5%) | ArtifactsSource |
 | `EXTENSION` | 10 minutes | ArtifactsSource |
 | `ESCROW_TIMEOUT` | 72 hours | ArtifactsPiece |
@@ -112,10 +123,14 @@ current owner. Every piece pays a 7.5% ERC-2981 royalty to its artist's payout a
 - The curator (owner) approves artists, brokers and sale modules, sets prices and splits, publishes the
   ARTIFACTS ciphertexts/commitments before locking, posts first-claim wrapped keys, and runs THE SOURCE auction.
   Until the last claim the curator holds every content key (PROTOCOL.md). The contracts cannot verify that a
-  wrapped key opens; a dishonest seller in escrow can post a bad key (disclosed in PROTOCOL.md).
+  wrapped key opens; a dishonest seller in escrow can post a bad (non-empty) key (disclosed in PROTOCOL.md).
+- `setSplit` is read at sale time: the curator can change a module collection's split while bids or purchases
+  are pending (e.g. before THE SOURCE settles). This is an owner power by design, not a bypass; bidders trust the
+  curator not to redirect the artist's or broker's share after the fact.
 - Chainlink VRF is the only randomness; the subscription must stay funded or purchases revert at request time.
-  A purchase whose callback never arrives keeps the buyer's payment in the ledger with no edition: the curator
-  should monitor pending requests (`sold` vs `assigned`). The mock coordinator in tests is not production randomness.
+  A purchase whose callback never arrives keeps the buyer's payment in the ledger with no edition until the
+  curator calls `rerequestRandomness` (above); only the curator can, so the buyer relies on the curator doing so.
+  The mock coordinator in tests is not production randomness.
 - IMD is assumed to be a standard ERC-20 (no fee on transfer); `mintWithIMD` checks the balance delta.
 - Tests passing is not an audit. Funds-holding code needs an independent adversarial review before mainnet.
 

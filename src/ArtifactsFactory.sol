@@ -13,6 +13,9 @@ contract ArtifactsFactory is TwoStepOwnable, ReentrancyGuard {
     uint256 public constant EDITIONS = 255;
     uint32 public constant VRF_CALLBACK_GAS = 250_000;
     uint16 public constant VRF_CONFIRMATIONS = 3;
+    /// @dev Blocks a VRF request may stay unfulfilled before the curator can re-request it (~24h at 12s blocks,
+    /// Chainlink's own retry window for an underfunded subscription).
+    uint256 public constant VRF_RETRY_BLOCKS = 7_200;
 
     IArtHouse public immutable house;
     address public immutable pieceImplementation;
@@ -43,6 +46,7 @@ contract ArtifactsFactory is TwoStepOwnable, ReentrancyGuard {
 
     mapping(uint256 => address) public requestBuyer;
     mapping(uint256 => uint256) public requestEdition;
+    mapping(uint256 => uint256) public requestBlock;
     mapping(uint16 => uint16) private _pool; // Fisher-Yates over 1..255, lazily initialised
     mapping(uint256 => address) public editionBuyer;
     mapping(address => uint256[]) private _editionsOf;
@@ -59,6 +63,7 @@ contract ArtifactsFactory is TwoStepOwnable, ReentrancyGuard {
     event VRFConfigured(address coordinator, bytes32 keyHash, uint256 subscriptionId, bool nativePayment);
     event Purchased(address indexed buyer, address indexed broker, uint256 requestId, uint256 price);
     event EditionAssigned(uint256 indexed edition, address indexed buyer, uint256 requestId);
+    event Rerequested(uint256 indexed oldRequestId, uint256 indexed newRequestId, address indexed buyer);
     event ViewingKeyRegistered(address indexed account, bytes32 key);
     event WrappedKeyPosted(uint256 indexed edition);
     event Claimed(uint256 indexed edition, address indexed owner, address piece);
@@ -81,6 +86,7 @@ contract ArtifactsFactory is TwoStepOwnable, ReentrancyGuard {
     error KeyNotPosted();
     error AlreadyClaimed();
     error AlreadyFulfilled();
+    error RequestTooRecent();
 
     constructor(address owner_, address house_, address pieceImplementation_) TwoStepOwnable(owner_) {
         if (house_ == address(0) || pieceImplementation_ == address(0)) revert ZeroAddress();
@@ -160,6 +166,25 @@ contract ArtifactsFactory is TwoStepOwnable, ReentrancyGuard {
         if (address(vrfCoordinator) == address(0)) revert VRFNotConfigured();
         sold += 1;
         house.recordSale{value: msg.value}(address(this), msg.sender, broker);
+        requestId = _requestRandomness(msg.sender);
+        emit Purchased(msg.sender, broker, requestId, msg.value);
+    }
+
+    /// @notice If the coordinator never answered a purchase's request (e.g. the subscription ran dry and Chainlink
+    /// dropped it), the curator may ask again after VRF_RETRY_BLOCKS. The old id is forgotten, so a late answer
+    /// to it is rejected as unknown and the buyer still gets exactly one edition.
+    function rerequestRandomness(uint256 requestId) external onlyOwner returns (uint256 newRequestId) {
+        address buyer = requestBuyer[requestId];
+        if (buyer == address(0)) revert UnknownRequest();
+        if (requestEdition[requestId] != 0) revert AlreadyFulfilled();
+        if (block.number < requestBlock[requestId] + VRF_RETRY_BLOCKS) revert RequestTooRecent();
+        delete requestBuyer[requestId];
+        delete requestBlock[requestId];
+        newRequestId = _requestRandomness(buyer);
+        emit Rerequested(requestId, newRequestId, buyer);
+    }
+
+    function _requestRandomness(address buyer) private returns (uint256 requestId) {
         requestId = vrfCoordinator.requestRandomWords(
             IVRFCoordinatorV2Plus.RandomWordsRequest({
                 keyHash: vrfKeyHash,
@@ -171,8 +196,8 @@ contract ArtifactsFactory is TwoStepOwnable, ReentrancyGuard {
             })
         );
         if (requestBuyer[requestId] != address(0)) revert AlreadyFulfilled();
-        requestBuyer[requestId] = msg.sender;
-        emit Purchased(msg.sender, broker, requestId, msg.value);
+        requestBuyer[requestId] = buyer;
+        requestBlock[requestId] = block.number;
     }
 
     /// @notice VRF callback: assigns a uniformly random unassigned edition (Fisher-Yates over the remaining set).

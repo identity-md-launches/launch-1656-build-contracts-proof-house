@@ -124,7 +124,8 @@ contract ArtifactsSource is TwoStepOwnable, ReentrancyGuard {
         if (!auctionOpen) revert AuctionNotOpen();
         if (block.timestamp >= endTime) revert AuctionEnded();
         if (msg.value < reserve) revert BidTooLow();
-        if (highBid != 0 && msg.value < highBid + (highBid * MIN_RAISE_BPS) / 10_000) revert BidTooLow();
+        // the 5% raise rounds up, so a bid must strictly exceed the high bid even at dust sizes
+        if (highBid != 0 && msg.value < (highBid * (10_000 + MIN_RAISE_BPS) + 9_999) / 10_000) revert BidTooLow();
         if (highBidder != address(0)) refunds[highBidder] += highBid;
         highBidder = msg.sender;
         highBid = msg.value;

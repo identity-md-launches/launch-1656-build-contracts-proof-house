@@ -91,6 +91,7 @@ contract ArtHouse is TwoStepOwnable, ReentrancyGuard {
     event PricesSet(address indexed collection, uint256 priceETH, uint256 priceIMD);
     event SaleOpenSet(address indexed collection, bool open);
     event PieceRegistered(address indexed collection, uint256 indexed pieceId, bytes32 contentHash, string title);
+    event PieceUpdated(address indexed collection, uint256 indexed pieceId, bytes32 contentHash, string title);
     event PieceCleared(address indexed collection, uint256 indexed pieceId);
     event PieceFinalized(address indexed collection, uint256 indexed pieceId);
     event CollectionSealed(address indexed collection);
@@ -238,8 +239,10 @@ contract ArtHouse is TwoStepOwnable, ReentrancyGuard {
 
     // ---------- piece curation (plain SVG) ----------
 
+    /// @dev The curator, or the collection's artist while still approved: revocation ends curation rights too.
     function _curatorOrArtist(Collection storage c) private view {
-        if (msg.sender != owner && msg.sender != c.artist) revert NotCurator();
+        if (msg.sender == owner) return;
+        if (msg.sender != c.artist || !artists[c.artist].approved) revert NotCurator();
     }
 
     function registerPiece(
@@ -260,6 +263,28 @@ contract ArtHouse is TwoStepOwnable, ReentrancyGuard {
         p.title = title;
         p.description = description;
         emit PieceRegistered(collection, pieceId, contentHash, title);
+    }
+
+    /// @notice Corrects an unfinalized piece's content hash, title and description (a mistyped hash would otherwise
+    /// leave the collection unsealable forever). Uploaded chunks are kept; finalizePiece checks against the new hash.
+    function updatePiece(
+        address collection,
+        uint256 pieceId,
+        bytes32 contentHash,
+        string calldata title,
+        string calldata description
+    ) external {
+        Collection storage c = collections[collection];
+        if (!c.exists || c.isModule) revert UnknownCollection();
+        _curatorOrArtist(c);
+        if (c.isSealed) revert Sealed();
+        if (pieceId >= c.pieceCount) revert BadPieceId();
+        Piece storage p = pieces[collection][pieceId];
+        if (p.finalized) revert Finalized();
+        p.contentHash = contentHash;
+        p.title = title;
+        p.description = description;
+        emit PieceUpdated(collection, pieceId, contentHash, title);
     }
 
     function uploadChunk(address collection, uint256 pieceId, uint256 index, bytes calldata data) external {

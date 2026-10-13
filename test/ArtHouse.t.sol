@@ -151,6 +151,68 @@ contract ArtHouseTest is Fixture {
         house.registerPiece(address(col), 1, keccak256(svg), "P", "D");
     }
 
+    /// @dev A mistyped content hash is correctable while the piece is unfinalized, so the collection is not
+    /// stranded; once finalized or sealed it is fixed.
+    function test_wrongHashIsCorrectable() public {
+        vm.startPrank(artist);
+        house.registerPiece(address(col), 0, keccak256("typo"), "P", "D");
+        house.uploadChunk(address(col), 0, 0, svg);
+        vm.expectRevert(ArtHouse.HashMismatch.selector);
+        house.finalizePiece(address(col), 0);
+        vm.expectRevert(ArtHouse.BadPieceId.selector);
+        house.registerPiece(address(col), 0, keccak256(svg), "P", "D");
+        vm.expectRevert(ArtHouse.BadPieceId.selector);
+        house.updatePiece(address(col), 1, keccak256(svg), "P", "D");
+        vm.stopPrank();
+        vm.prank(alice);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.updatePiece(address(col), 0, keccak256(svg), "P", "D");
+        vm.prank(curator);
+        house.updatePiece(address(col), 0, keccak256(svg), "Fixed", "Desc");
+        (bytes32 hash, string memory title,,,,) = house.pieces(address(col), 0);
+        assertEq(hash, keccak256(svg));
+        assertEq(title, "Fixed");
+        assertEq(store.chunkCount(address(col), 0), 1); // chunks are kept
+        vm.prank(artist);
+        house.finalizePiece(address(col), 0);
+        vm.prank(artist);
+        vm.expectRevert(ArtHouse.Finalized.selector);
+        house.updatePiece(address(col), 0, keccak256("x"), "P", "D");
+        vm.prank(curator);
+        house.sealCollection(address(col));
+        vm.prank(curator);
+        vm.expectRevert(ArtHouse.Sealed.selector);
+        house.updatePiece(address(col), 0, keccak256("x"), "P", "D");
+        vm.prank(curator);
+        vm.expectRevert(ArtHouse.UnknownCollection.selector);
+        house.updatePiece(address(factory), 0, keccak256("x"), "P", "D");
+    }
+
+    /// @dev Revoking an artist ends their curation rights over existing collections; re-approval restores them.
+    function test_revokedArtistLosesCuration() public {
+        vm.prank(artist);
+        house.registerPiece(address(col), 0, keccak256(svg), "P", "D");
+        vm.prank(curator);
+        house.revokeArtist(artist);
+        vm.startPrank(artist);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.registerPiece(address(col), 1, keccak256(svg), "P", "D");
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.uploadChunk(address(col), 0, 0, svg);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.updatePiece(address(col), 0, keccak256(svg), "P", "D");
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.finalizePiece(address(col), 0);
+        vm.stopPrank();
+        // the curator still can
+        vm.prank(curator);
+        house.uploadChunk(address(col), 0, 0, svg);
+        vm.prank(curator);
+        house.approveArtist(artist, "Myles");
+        vm.prank(artist);
+        house.finalizePiece(address(col), 0);
+    }
+
     function test_pieceOver100KBRejected() public {
         vm.startPrank(artist);
         house.registerPiece(address(col), 0, bytes32(uint256(1)), "P", "D");
