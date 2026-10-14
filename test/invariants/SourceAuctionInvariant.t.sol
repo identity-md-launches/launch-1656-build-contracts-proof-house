@@ -37,7 +37,8 @@ contract AuctionHandler is Test {
     function _minBid() internal view returns (uint256) {
         uint256 high = source.highBid();
         uint256 reserve = source.reserve();
-        uint256 raise = high == 0 ? 0 : high + (high * 500) / 10_000;
+        // the 5% raise rounds up: the smallest bid that is at least 105% of the high bid
+        uint256 raise = high == 0 ? 0 : (high * 10_500 + 9_999) / 10_000;
         return raise > reserve ? raise : reserve;
     }
 
@@ -56,8 +57,10 @@ contract AuctionHandler is Test {
         uint64 end = source.endTime();
         uint256 high = source.highBid();
         address prev = source.highBidder();
+        // independent of _minBid: a bid is valid iff 10_000 * amount >= 10_500 * high (and it meets the reserve)
         bool ok = open && block.timestamp < end && amount >= source.reserve()
-            && (high == 0 || amount >= high + (high * 500) / 10_000);
+            && (high == 0 || amount * 10_000 >= high * 10_500);
+        if (high != 0 && amount <= high) assertFalse(ok, "a bid can never tie or undercut the high bid");
         uint256 prevRefund = prev == address(0) ? 0 : source.refunds(prev);
         vm.prank(actor);
         if (!ok) vm.expectRevert();

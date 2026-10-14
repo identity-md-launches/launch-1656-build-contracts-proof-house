@@ -88,10 +88,14 @@ contract EscrowHandler is Test {
     function postKey(uint256 a, bytes calldata wrapped) external {
         address actor = actors[a % actors.length];
         (, address seller, address buyer,, bool keyPosted) = _escrow();
-        bool ok = actor == seller && buyer != address(0) && !keyPosted;
+        bool ok = actor == seller && buyer != address(0) && !keyPosted && wrapped.length > 0;
         vm.prank(actor);
         if (!ok) vm.expectRevert();
         piece.postEscrowKey(wrapped);
+        if (ok) {
+            (,,,, bool posted,) = piece.escrow();
+            assertTrue(posted);
+        }
     }
 
     function cancel(uint256 a) external {
@@ -116,6 +120,7 @@ contract EscrowHandler is Test {
         bool ok = buyer != address(0) && keyPosted && (actor == buyer || block.timestamp >= paidAt + 72 hours);
         uint256 sellerBefore = piece.pendingWithdrawals(seller);
         uint256 royaltyBefore = piece.pendingWithdrawals(royaltyTo);
+        (,,,,, bytes memory keyBefore) = piece.escrow();
         vm.prank(actor);
         if (!ok) vm.expectRevert();
         piece.release();
@@ -128,7 +133,8 @@ contract EscrowHandler is Test {
                 assertEq(piece.pendingWithdrawals(seller), sellerBefore + price - royalty, "seller proceeds");
                 assertEq(piece.pendingWithdrawals(royaltyTo), royaltyBefore + royalty, "royalty credited");
             }
-            assertEq(piece.previousOwner(), seller);
+            assertEq(piece.previousOwner(), address(0), "a paid seller keeps no re-key right");
+            assertEq(keccak256(piece.wrappedKey()), keccak256(keyBefore), "the escrowed key is delivered");
             (, address s, address b,,) = _escrow();
             assertEq(s, address(0));
             assertEq(b, address(0));
@@ -203,18 +209,31 @@ contract EscrowHandler is Test {
 
     function registerKey(uint256 a, bytes32 key) external {
         address actor = actors[a % actors.length];
+        if (a % 5 == 0) key = bytes32(0);
+        bytes32 before = piece.viewingKeyOf(actor);
         vm.prank(actor);
+        if (key == bytes32(0)) vm.expectRevert(ArtifactsPiece.NoViewingKey.selector);
         piece.registerViewingKey(key);
-        assertEq(piece.viewingKeyOf(actor), key);
+        assertEq(piece.viewingKeyOf(actor), key == bytes32(0) ? before : key);
     }
 
+    /// @dev One shot: only the previous owner, only into an empty slot, never empty, and the right ends with it.
     function rewrap(uint256 a, bytes calldata wrapped) external {
         address actor = actors[a % actors.length];
-        bool ok = actor == piece.previousOwner() && piece.viewingKeyOf(piece.ownerOf(1)) != bytes32(0);
+        bytes memory keyBefore = piece.wrappedKey();
+        address prevBefore = piece.previousOwner();
+        bool ok = actor == prevBefore && keyBefore.length == 0 && wrapped.length > 0
+            && piece.viewingKeyOf(piece.ownerOf(1)) != bytes32(0);
         vm.prank(actor);
         if (!ok) vm.expectRevert();
         piece.rewrapFor(wrapped);
-        if (ok) assertEq(piece.wrappedKey(), wrapped);
+        if (ok) {
+            assertEq(piece.wrappedKey(), wrapped);
+            assertEq(piece.previousOwner(), address(0), "re-key right is spent");
+        } else {
+            assertEq(keccak256(piece.wrappedKey()), keccak256(keyBefore), "a failed re-key changes nothing");
+            assertEq(piece.previousOwner(), prevBefore);
+        }
     }
 
     function warp(uint256 delta) external {

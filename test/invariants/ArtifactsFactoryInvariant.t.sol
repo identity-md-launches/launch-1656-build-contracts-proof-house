@@ -26,6 +26,7 @@ contract FactoryHandler is Test {
     uint256 public seenCount;
     uint256 public paid;
     uint256 public claims;
+    uint256 public rerequests;
 
     constructor(
         ArtifactsFactory f,
@@ -93,6 +94,44 @@ contract FactoryHandler is Test {
         assertEq(factory.editionBuyer(e), requestBuyer[id], "edition goes to the request's buyer");
         assignedEditions.push(e);
         fulfilled.push(id);
+    }
+
+    /// @dev The curator re-requests a pending purchase: too early it is refused unchanged; after the window the
+    /// old id is dead and the new one carries the same buyer, so the purchase stays exactly one pending request.
+    function rerequest(uint256 idx, bool wait) external {
+        if (pending.length == 0) return;
+        idx %= pending.length;
+        uint256 id = pending[idx];
+        address buyer = requestBuyer[id];
+        uint256 due = factory.requestBlock(id) + factory.VRF_RETRY_BLOCKS();
+        if (wait && vm.getBlockNumber() < due) vm.roll(due);
+        bool ok = vm.getBlockNumber() >= due;
+        vm.prank(curator);
+        if (!ok) vm.expectRevert(ArtifactsFactory.RequestTooRecent.selector);
+        uint256 newId = factory.rerequestRandomness(id);
+        if (!ok) {
+            assertEq(factory.requestBuyer(id), buyer, "refused re-request changes nothing");
+            return;
+        }
+        assertTrue(newId != id);
+        assertEq(factory.requestBuyer(id), address(0), "old id forgotten");
+        assertEq(factory.requestBuyer(newId), buyer, "same buyer");
+        assertEq(factory.requestEdition(newId), 0);
+        vm.expectRevert(ArtifactsFactory.UnknownRequest.selector);
+        vrf.fulfill(id, idx);
+        pending[idx] = newId;
+        requestBuyer[newId] = buyer;
+        rerequests++;
+    }
+
+    function strangerRerequest(uint256 idx) external {
+        if (pending.length == 0) return;
+        uint256 id = pending[idx % pending.length];
+        vm.roll(vm.getBlockNumber() + factory.VRF_RETRY_BLOCKS());
+        vm.prank(buyers[idx % buyers.length]);
+        vm.expectRevert();
+        factory.rerequestRandomness(id);
+        assertEq(factory.requestBuyer(id), requestBuyer[id]);
     }
 
     function replay(uint256 idx, uint256 word) external {
@@ -192,6 +231,12 @@ contract ArtifactsFactoryInvariantTest is Fixture {
         assertEq(factory.remaining(), 255 - factory.sold());
         assertEq(factory.assigned(), h.seenCount());
         assertEq(factory.assigned() + h.pendingCount(), factory.sold(), "every purchase is pending or assigned");
+        // re-requests never create purchases or editions: every pending id still maps to its buyer, unassigned
+        for (uint256 i; i < h.pendingCount(); ++i) {
+            uint256 id = h.pending(i);
+            assertEq(factory.requestBuyer(id), h.requestBuyer(id));
+            assertEq(factory.requestEdition(id), 0);
+        }
     }
 
     /// @dev Every purchase's ETH sits in the ledger, split and owed to artist / broker / house.

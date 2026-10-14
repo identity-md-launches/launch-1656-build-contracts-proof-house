@@ -63,6 +63,35 @@ contract RevertingCoordinator {
     }
 }
 
+/// @dev A coordinator that can be switched to revert (subscription ran dry) and back; sequential ids otherwise.
+contract TogglingCoordinator {
+    bool public failing;
+    uint256 public nextId = 1000;
+    mapping(uint256 => address) public consumer;
+
+    function setFailing(bool v) external {
+        failing = v;
+    }
+
+    function requestRandomWords(IVRFCoordinatorV2Plus.RandomWordsRequest calldata) external returns (uint256 id) {
+        if (failing) revert("InsufficientBalance");
+        id = nextId++;
+        consumer[id] = msg.sender;
+    }
+
+    function fulfill(uint256 id, uint256 word) external {
+        uint256[] memory words = new uint256[](1);
+        words[0] = word;
+        (bool ok, bytes memory ret) =
+            consumer[id].call(abi.encodeWithSignature("rawFulfillRandomWords(uint256,uint256[])", id, words));
+        if (!ok) {
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+    }
+}
+
 /// @dev An ERC-721 receiver that rejects, and one that accepts and re-enters the piece.
 contract RejectingReceiver {
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

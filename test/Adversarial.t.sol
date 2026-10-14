@@ -19,6 +19,7 @@ import {
     FalseReturningToken,
     DuplicateIdCoordinator,
     RevertingCoordinator,
+    TogglingCoordinator,
     RejectingReceiver,
     ReenteringReceiver,
     StubController
@@ -337,6 +338,59 @@ contract ArtHouseEdgeTest is Fixture {
         house.sealCollection(address(col));
     }
 
+    /// @dev updatePiece: nothing to update in an empty collection; another approved artist, a pending owner and a
+    /// revoked artist are all refused; the curator or the collection's artist may fix hash, title and description
+    /// and the emitted event carries the new values.
+    function test_updatePieceAccessEdges() public {
+        vm.prank(curator);
+        vm.expectRevert(ArtHouse.BadPieceId.selector);
+        house.updatePiece(address(col), 0, keccak256(svg), "P", "D");
+        address other = makeAddr("other");
+        vm.prank(curator);
+        house.approveArtist(other, "Other");
+        vm.prank(curator);
+        ArtCollection col2 = ArtCollection(house.createCollection("Other", "OTH", other));
+        vm.prank(artist);
+        house.registerPiece(address(col), 0, keccak256("typo"), "P", "D");
+        // an approved artist of a different collection is a stranger here
+        vm.prank(other);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.updatePiece(address(col), 0, keccak256(svg), "P", "D");
+        vm.prank(artist);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.updatePiece(address(col2), 0, keccak256(svg), "P", "D");
+        // a pending owner has no power until accepting
+        vm.prank(curator);
+        house.transferOwnership(carol);
+        vm.prank(carol);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.updatePiece(address(col), 0, keccak256(svg), "P", "D");
+        vm.expectEmit(true, true, false, true, address(house));
+        emit ArtHouse.PieceUpdated(address(col), 0, keccak256(svg), "Fixed");
+        vm.prank(artist);
+        house.updatePiece(address(col), 0, keccak256(svg), "Fixed", "New desc");
+        (bytes32 hash, string memory title, string memory description, bool finalized,, uint256 size) =
+            house.pieces(address(col), 0);
+        assertEq(hash, keccak256(svg));
+        assertEq(title, "Fixed");
+        assertEq(description, "New desc");
+        assertFalse(finalized);
+        assertEq(size, 0);
+        // once revoked the artist cannot touch it, even to restore the old values; the curator still can
+        vm.prank(curator);
+        house.revokeArtist(artist);
+        vm.prank(artist);
+        vm.expectRevert(ArtHouse.NotCurator.selector);
+        house.updatePiece(address(col), 0, keccak256("typo"), "P", "D");
+        vm.prank(curator);
+        house.uploadChunk(address(col), 0, 0, svg);
+        vm.prank(curator);
+        house.finalizePiece(address(col), 0);
+        (,,, finalized,, size) = house.pieces(address(col), 0);
+        assertTrue(finalized);
+        assertEq(size, svg.length);
+    }
+
     function test_sealEmptyCollectionRevertsAndSealIsOnce() public {
         vm.prank(curator);
         vm.expectRevert(ArtHouse.NotFinalized.selector);
@@ -632,6 +686,102 @@ contract ArtifactsEdgeTest is Fixture {
         assertEq(factory.remaining(), 247);
     }
 
+    /// @dev The retry window is exact: one block short is too recent, the boundary block is allowed; a re-request
+    /// can itself be re-requested after another full window; the forgotten ids never fulfil; sold, the ledger
+    /// and the buyer's edition count are unchanged by any number of re-requests.
+    function test_rerequestWindowBoundaryAndChaining() public {
+        _publishAll();
+        _openSale(1 ether);
+        uint256 start = vm.getBlockNumber();
+        vm.prank(alice);
+        uint256 id0 = factory.buy{value: 1 ether}(address(0));
+        assertEq(factory.requestBlock(id0), start);
+        uint256 window = factory.VRF_RETRY_BLOCKS();
+
+        vm.roll(start + window - 1);
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.RequestTooRecent.selector);
+        factory.rerequestRandomness(id0);
+        // the sale being closed does not block a paid purchase's re-request
+        vm.prank(curator);
+        factory.setSaleOpen(false);
+        vm.roll(start + window);
+        vm.prank(curator);
+        uint256 id1 = factory.rerequestRandomness(id0);
+        assertEq(factory.requestBlock(id1), start + window);
+        assertEq(factory.requestBlock(id0), 0, "old request forgotten");
+        assertEq(factory.requestBuyer(id0), address(0));
+        // the same old id cannot be re-requested twice
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.UnknownRequest.selector);
+        factory.rerequestRandomness(id0);
+        // chain: the new request needs its own full window
+        vm.roll(start + 2 * window - 1);
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.RequestTooRecent.selector);
+        factory.rerequestRandomness(id1);
+        vm.roll(start + 2 * window);
+        vm.prank(curator);
+        uint256 id2 = factory.rerequestRandomness(id1);
+        assertTrue(id2 != id1 && id2 != id0);
+        assertEq(factory.requestBuyer(id2), alice);
+        // every forgotten id is dead, whatever word the coordinator sends
+        vm.expectRevert(ArtifactsFactory.UnknownRequest.selector);
+        vrf.fulfill(id0, 1);
+        vm.expectRevert(ArtifactsFactory.UnknownRequest.selector);
+        vrf.fulfill(id1, 1);
+        assertEq(factory.sold(), 1, "re-requests are not purchases");
+        assertEq(factory.assigned(), 0);
+        assertEq(factory.remaining(), 254);
+        assertEq(address(house).balance, 1 ether, "no second payment");
+        vrf.fulfill(id2, 77);
+        uint256 e = factory.requestEdition(id2);
+        assertEq(e, 77 % 255 + 1);
+        assertEq(factory.editionBuyer(e), alice);
+        assertEq(factory.editionsOf(alice).length, 1, "exactly one edition for one purchase");
+        assertEq(factory.assigned(), 1);
+        // the edition is claimable as any other
+        ArtifactsPiece p = _claim(alice, e);
+        assertEq(p.ownerOf(1), alice);
+        assertEq(p.pieceId(), e);
+    }
+
+    /// @dev A re-request whose coordinator call reverts leaves the original request intact and retryable.
+    function test_rerequestIsAtomicWhenCoordinatorReverts() public {
+        TogglingCoordinator coord = new TogglingCoordinator();
+        ArtifactsFactory f = new ArtifactsFactory(curator, address(house), address(pieceImpl));
+        vm.startPrank(curator);
+        house.setSaleModule(address(f), true);
+        house.registerModuleCollection(address(f), artist);
+        f.configureVRF(address(coord), KEY_HASH, SUB_ID, false);
+        for (uint256 i = 1; i <= 255; ++i) {
+            f.setPiece(i, _traits(i), "c", keccak256(abi.encode(i)));
+        }
+        f.lock();
+        f.setPrice(1 ether);
+        f.setSaleOpen(true);
+        vm.stopPrank();
+        vm.prank(bob);
+        uint256 id = f.buy{value: 1 ether}(broker);
+        uint256 at = vm.getBlockNumber();
+        coord.setFailing(true);
+        vm.roll(at + f.VRF_RETRY_BLOCKS());
+        vm.prank(curator);
+        vm.expectRevert("InsufficientBalance");
+        f.rerequestRandomness(id);
+        assertEq(f.requestBuyer(id), bob, "original request kept");
+        assertEq(f.requestBlock(id), at);
+        // once the subscription is funded again the same request can be retried, and the late original answer
+        // is still accepted if it arrives before the retry
+        coord.setFailing(false);
+        coord.fulfill(id, 3);
+        assertEq(f.requestEdition(id), 4);
+        vm.prank(curator);
+        vm.expectRevert(ArtifactsFactory.AlreadyFulfilled.selector);
+        f.rerequestRandomness(id);
+        assertEq(f.editionsOf(bob).length, 1);
+    }
+
     function test_wrappedKeyEdges() public {
         _publishAll();
         _openSale(1 ether);
@@ -832,10 +982,17 @@ contract PieceEdgeTest is Fixture {
         vm.prank(alice);
         vm.expectRevert(ArtifactsPiece.NotSeller.selector);
         piece.delist();
-        // the previous owner may still re-wrap after an escrow sale (bob registered a key when buying)
+        // the escrowed key is delivered and stands: the paid seller keeps no re-key right, so the key bob paid
+        // for can never be overwritten (not even with an empty one)
+        assertEq(piece.wrappedKey(), "k");
+        assertEq(piece.previousOwner(), address(0));
         vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.NotPreviousOwner.selector);
         piece.rewrapFor("again");
-        assertEq(piece.wrappedKey(), "again");
+        vm.prank(alice);
+        vm.expectRevert(ArtifactsPiece.NotPreviousOwner.selector);
+        piece.rewrapFor("");
+        assertEq(piece.wrappedKey(), "k");
     }
 
     function test_cancelThenSecondBuyerAndRoyaltyToChangedPayout() public {
@@ -1036,6 +1193,35 @@ contract SourceEdgeTest is Fixture {
         vm.prank(bob);
         vm.expectRevert(ArtifactsSource.AuctionEnded.selector);
         source.bid{value: 3 ether}(address(0));
+    }
+
+    /// @dev For any high bid, the smallest accepted raise is the exact ceiling of 105%: one wei less is refused,
+    /// and it always strictly exceeds the high bid (no ties at dust sizes).
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_minimumRaiseIsCeilingOfFivePercent(uint96 first, uint96 nextSeed) public {
+        _lock();
+        vm.prank(curator);
+        source.setAuction(1, uint64(vm.getBlockTimestamp() + 1 hours));
+        uint256 high = bound(first, 1, type(uint96).max);
+        vm.deal(alice, high);
+        vm.prank(alice);
+        source.bid{value: high}(address(0));
+        uint256 min = (high * 10_500 + 9_999) / 10_000;
+        assertGt(min, high, "a raise always strictly exceeds the high bid");
+        assertGe(min * 10_000, high * 10_500, "min is at least 105%");
+        assertLt((min - 1) * 10_000, high * 10_500, "min is the smallest such amount");
+        vm.deal(bob, min - 1);
+        vm.prank(bob);
+        vm.expectRevert(ArtifactsSource.BidTooLow.selector);
+        source.bid{value: min - 1}(address(0));
+        assertEq(source.highBidder(), alice);
+        uint256 next = bound(nextSeed, min, min + 1 ether);
+        vm.deal(bob, next);
+        vm.prank(bob);
+        source.bid{value: next}(address(0));
+        assertEq(source.highBidder(), bob);
+        assertEq(source.highBid(), next);
+        assertEq(source.refunds(alice), high);
     }
 
     function test_settleEdges_brokerSplit() public {
